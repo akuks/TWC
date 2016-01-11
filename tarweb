@@ -1,0 +1,161 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+sub missingModules {
+    my @missing ;
+
+    # This one might be just tried and pulled in when it exists. So
+    # missing it is not an error. We use "my" variables here as other
+    # bindings would be allocated too late.
+
+    #/ Note: not used at the moment
+    my %check_ignore = map {$_ => 1} qw (Encode::ConfigLocal);
+
+    for my $mod (@_) {
+        eval {
+            local $SIG {__DIE__} = sub {
+
+                return unless 
+                    $_ [0] =~ m|([-\w_./]+).pm| ;
+
+                my $a = $1 ;
+                $a =~ s|/|::|g ;
+
+                if ($a ne $mod) {
+                    return if 
+                        $check_ignore {$a} ;
+
+                    $a = "$mod($a)" ;
+                }
+
+                push @missing, $a ;
+            };
+        
+            eval "require $mod;" ;
+        }
+    }
+    
+    @missing ;
+}
+sub BEGIN {
+
+    my $start_run = time();
+
+    my @w;
+
+    goto fail if
+        @w = missingModules qw (
+                Data::Dumper
+                HTTP::Daemon
+                LWP::UserAgent
+                HTTP::Cache::Transparent
+                Cache::Cache
+                Cache::FastMmap
+                Cache::Memcached::libmemcached
+                CHI::Driver::Memcached::libmemcached
+                Memcached::libmemcached
+            );
+
+    return ;
+
+    fail:
+        $" = ', ' ;
+    print STDERR "Please install PERL module(s): @w!\n";
+    exit 2;
+}
+
+#------------------------
+
+use HTTP::Daemon;
+use LWP::Simple;
+use LWP::UserAgent;
+use HTTP::Cache::Transparent;
+use Data::Dumper;
+
+
+######################
+# Custom Modules
+######################
+use configRead;
+use webCacheLog;
+
+my $file = "conf/conf.conf";
+
+my $c = configRead->new($file);
+
+my $conf = $c->getConf();
+
+print Dumper($conf);
+
+
+my $log = webCacheLog->new($conf->{logDir});  # initialize webCacheLog
+
+
+#####################
+# ----- Main -----  #
+#####################
+
+my $server = $conf->{hostname}.":".
+        $conf->{port};
+
+$log->info("Web Server Infomation : ", $server);
+
+
+my $cache = HTTP::Cache::Transparent::init( {
+    BasePath       => "/opt/webCacheEng/sCache",
+    MaxAge         => 8*24,
+    Verbose        => 1,
+    NoUpdate       => 0,
+    ApproveContent => sub { return $_[0]->is_success(); },
+  } );
+
+my $ua = LWP::UserAgent->new();
+
+my $d = HTTP::Daemon->new(
+        LocalHost => $conf->{hostname},  # remove this to listen from other machines
+                                   # (i.e. open-relay... be careful of spammers!)
+        LocalPort => $conf->{port}
+) || die;
+
+#print "[Proxy URL:", $d->url, "]\n";
+$log->info("[Proxy URL:", $d->url, "]");
+
+# Avoid dying from browser cancel
+$SIG{PIPE} = 'IGNORE';
+
+fork(); fork(); fork();  # 2^3 = 8 processes
+
+while (my $c = $d->accept) {
+    while (my $request = $c->get_request) {
+        print $c->sockhost . ": " . $request->uri->as_string . "\n";
+
+        $request->push_header( Via => "1.1 ". $c->sockhost );
+        my $response = $ua->simple_request( $request );
+
+        my $data = get( $request->uri->as_string ); # Cache
+
+	if ($data) {
+	     $c->send_response( $data );
+	}else {
+            $c->send_response( $response );
+	}
+
+        # Save the response content into file
+        if( ($request->method eq "GET" || $request->method eq "POST") 
+            && $response->is_success && length($response->content) > 10 ) {
+
+            my $uri = $request->uri->as_string;
+            $uri =~ s#/#_#g;
+
+#            my $data = get( $uri ); # Cache
+
+            open(F, ">$uri") || print "Cannot write $uri\n";;
+            print F $response->content;
+            close F;
+        }
+    }
+    $c->close;
+    undef($c);
+}
